@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"AppleVault/src/backend/internal/ipatool/appstore"
 	ipahttp "AppleVault/src/backend/internal/ipatool/http"
 	"AppleVault/src/backend/internal/ipatool/keychain"
+	"AppleVault/src/backend/internal/ipatool/util/machine"
 	"AppleVault/src/backend/internal/ipatool/util/operatingsystem"
 	"github.com/byteness/keyring"
 	cookiejar "github.com/juju/persistent-cookiejar"
@@ -31,20 +31,12 @@ const (
 // localMachine keeps credentials and cookies inside AppleVault's data directory
 // instead of depending on ipatool's command-line environment overrides.
 type localMachine struct {
-	home string
+	home     string
+	identity machine.Machine
 }
 
-func (localMachine) MacAddress() (string, error) {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "", fmt.Errorf("读取网络接口失败: %w", err)
-	}
-	for _, item := range interfaces {
-		if address := item.HardwareAddr.String(); address != "" {
-			return address, nil
-		}
-	}
-	return "", errors.New("未找到有效的网卡地址")
+func (m localMachine) MacAddress() (string, error) {
+	return m.identity.MacAddress()
 }
 
 func (m localMachine) HomeDirectory() string { return m.home }
@@ -128,29 +120,56 @@ func (a *App) newAppStoreWithStorage(ctx context.Context, accountID string, lega
 			return nil, fmt.Errorf("代理地址格式无效: %w", err)
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
-		a.emitLog(fmt.Sprintf("[网络代理] 已启用: %s", proxyAddress))
+		a.emitLog(fmt.Sprintf("[网络代理] 已启用: %s", ipahttp.DiagnosticURL(proxyAddress)))
 	} else {
 		transport.Proxy = nil
 	}
 
 	osAdapter := operatingsystem.New()
-	return appstore.NewAppStore(appstore.Args{
-		CookieJar:       ipahttp.CookieJar(jar),
-		Keychain:        keychain.New(keychain.Args{Keyring: ring, Label: serviceName}),
-		Machine:         localMachine{home: a.getDataDir()},
-		OperatingSystem: osAdapter,
-		Context:         ctx,
-		Transport:       transport,
-	}), nil
+	a.writeDiagnostic("store.config", map[string]interface{}{"account_id": accountID, "proxy_enabled": enableProxy && proxyAddress != "", "proxy_endpoint": ipahttp.DiagnosticURL(proxyAddress), "identity_strategy": "ipatool-2.7.0"})
+	store := appstore.NewAppStore(appstore.Args{
+		CookieJar:        ipahttp.CookieJar(jar),
+		Keychain:         keychain.New(keychain.Args{Keyring: ring, Label: serviceName}),
+		Machine:          localMachine{home: a.getDataDir(), identity: machine.New(machine.Args{OS: osAdapter})},
+		OperatingSystem:  osAdapter,
+		Context:          ctx,
+		Transport:        transport,
+		DiagnosticLogger: a.writeDiagnostic,
+	})
+	if info, err := store.AccountInfo(); err == nil {
+		a.addDiagnosticSecrets(info.Account.Email, info.Account.Password, info.Account.PasswordToken, info.Account.DirectoryServicesID)
+	}
+	return store, nil
+}
+
+func authenticationErrorMessage(err error) string {
+	if errors.Is(err, appstore.ErrAuthenticationUnavailable) {
+		status := ""
+		var responseErr *ipahttp.UnexpectedResponseError
+		if errors.As(err, &responseErr) {
+			status = fmt.Sprintf("（HTTP %d）", responseErr.StatusCode)
+		}
+		return fmt.Sprintf("Apple 登录接口返回异常响应%s。请切换代理节点或网络后重试，或稍后再试。", status)
+	}
+	return err.Error()
 }
 
 func refreshAccount(store appstore.AppStore, account appstore.Account) (appstore.Account, error) {
+	if strings.TrimSpace(account.Email) == "" || account.Password == "" {
+		return appstore.Account{}, errors.New("缺少重新认证所需的凭据，请在账号中心重新登录")
+	}
 	result, err := store.Login(appstore.LoginInput{
 		Email:    account.Email,
 		Password: account.Password,
 	})
 	if err != nil {
-		return appstore.Account{}, err
+		if errors.Is(err, appstore.ErrAuthCodeRequired) {
+			return appstore.Account{}, fmt.Errorf("需要 Apple ID 双重认证，请在账号中心重新登录并输入验证码: %w", err)
+		}
+		if errors.Is(err, appstore.ErrAuthenticationUnavailable) {
+			return appstore.Account{}, fmt.Errorf("Apple ID 重新认证失败，请切换代理节点或网络后重试，或稍后再试: %w", err)
+		}
+		return appstore.Account{}, fmt.Errorf("Apple ID 重新认证失败: %w", err)
 	}
 	return result.Account, nil
 }
@@ -169,7 +188,7 @@ func withAccountRetry[T any](store appstore.AppStore, operation func(appstore.Ac
 
 	account, loginErr := refreshAccount(store, info.Account)
 	if loginErr != nil {
-		return zero, loginErr
+		return zero, fmt.Errorf("Apple ID 登录已失效: %w", loginErr)
 	}
 	return operation(account)
 }

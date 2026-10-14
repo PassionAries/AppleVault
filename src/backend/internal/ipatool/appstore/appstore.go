@@ -54,6 +54,8 @@ type appstore struct {
 	authRetrySleep      func(time.Duration)
 	machine             machine.Machine
 	os                  operatingsystem.OperatingSystem
+	diagnosticLogger    http.DiagnosticLogger
+	context             context.Context
 }
 
 type Args struct {
@@ -64,34 +66,52 @@ type Args struct {
 	ActionSignerFactory ActionSignerFactory
 	Context             context.Context
 	Transport           gohttp.RoundTripper
+	DiagnosticLogger    http.DiagnosticLogger
 }
 
 func NewAppStore(args Args) AppStore {
+	if args.Context == nil {
+		args.Context = context.Background()
+	}
 	clientArgs := http.Args{
-		CookieJar: args.CookieJar,
-		Context:   args.Context,
-		Transport: args.Transport,
+		CookieJar:        args.CookieJar,
+		Context:          args.Context,
+		Transport:        args.Transport,
+		DiagnosticLogger: args.DiagnosticLogger,
 	}
 
 	actionSignerFactory := args.ActionSignerFactory
 	if actionSignerFactory == nil {
 		actionSignerFactory = defaultActionSignerFactory
 	}
+	configuredSignerFactory := func(config SAPConfig, machineID []byte) (ActionSigner, error) {
+		config.DiagnosticLogger = args.DiagnosticLogger
+		config.Context = args.Context
+		config.Transport = args.Transport
+		return actionSignerFactory(config, machineID)
+	}
 
 	return &appstore{
 		keychain:            args.Keychain,
-		loginClient:         http.NewClient[loginResult](clientArgs),
+		loginClient:         http.NewClient[loginResult](http.Args{CookieJar: args.CookieJar, Context: args.Context, Transport: args.Transport, DiagnosticLogger: args.DiagnosticLogger, Authentication: true}),
 		searchClient:        http.NewClient[searchResult](clientArgs),
 		purchaseClient:      http.NewClient[purchaseResult](clientArgs),
 		downloadClient:      http.NewClient[downloadResult](clientArgs),
 		platformClient:      http.NewClient[platformVersionLookupResult](clientArgs),
 		storefrontClient:    http.NewClient[[]byte](clientArgs),
-		bagClient:           http.NewClient[bagResult](clientArgs),
+		bagClient:           http.NewClient[bagResult](http.Args{CookieJar: args.CookieJar, Context: args.Context, Transport: args.Transport, DiagnosticLogger: args.DiagnosticLogger, Timeout: http.DefaultAuthenticationTimeout}),
 		ownedAppsClient:     http.NewClient[[]byte](clientArgs),
 		httpClient:          http.NewClient[interface{}](clientArgs),
-		actionSignerFactory: actionSignerFactory,
-		authRetrySleep:      time.Sleep,
+		actionSignerFactory: configuredSignerFactory,
+		context:             args.Context,
 		machine:             args.Machine,
 		os:                  args.OperatingSystem,
+		diagnosticLogger:    args.DiagnosticLogger,
+	}
+}
+
+func (t *appstore) trace(event string, fields map[string]interface{}) {
+	if t.diagnosticLogger != nil {
+		t.diagnosticLogger(event, fields)
 	}
 }

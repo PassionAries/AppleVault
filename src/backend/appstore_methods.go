@@ -31,7 +31,19 @@ func (a *App) GetAccountInfo() (AccountInfo, error) {
 	return a.upsertAccount(result.Account, item.ID, item.Legacy)
 }
 
-func (a *App) Login(email, password, authCode string) (LoginResult, error) {
+func (a *App) Login(email, password, authCode string) (output LoginResult, resultErr error) {
+	a.addDiagnosticSecrets(email, password, authCode)
+	a.writeDiagnostic("login.start", map[string]interface{}{"has_auth_code": strings.TrimSpace(authCode) != ""})
+	defer func() {
+		fields := map[string]interface{}{"success": output.Success, "requires_2fa": output.Requires2FA}
+		if output.ErrorMessage != "" {
+			fields["error"] = output.ErrorMessage
+		}
+		if resultErr != nil {
+			fields["error"] = resultErr.Error()
+		}
+		a.writeDiagnostic("login.complete", fields)
+	}()
 	ctx := a.startCommandContext()
 	store, storageID, legacy, err := a.newAppStoreForLogin(ctx, email)
 	if err != nil {
@@ -45,7 +57,7 @@ func (a *App) Login(email, password, authCode string) (LoginResult, error) {
 		return LoginResult{Requires2FA: true, ErrorMessage: "需要 Apple ID 双重认证验证码"}, nil
 	}
 	if err != nil {
-		return LoginResult{ErrorMessage: err.Error()}, nil
+		return LoginResult{ErrorMessage: authenticationErrorMessage(err)}, nil
 	}
 
 	account, err := a.upsertAccount(result.Account, storageID, legacy)
@@ -93,7 +105,15 @@ func (a *App) Search(term string, limit int, platformValue string) (SearchResult
 	return SearchResult{Count: result.Count, Apps: mapStoreApps(result.Results)}, nil
 }
 
-func (a *App) ListVersions(bundleID string, appID int64) (VersionsResult, error) {
+func (a *App) ListVersions(bundleID string, appID int64) (output VersionsResult, resultErr error) {
+	a.writeDiagnostic("history.start", map[string]interface{}{"bundle_id": bundleID, "app_id": appID})
+	defer func() {
+		fields := map[string]interface{}{"success": output.Success, "count": len(output.ExternalVersionIdentifiers)}
+		if resultErr != nil {
+			fields["error"] = resultErr.Error()
+		}
+		a.writeDiagnostic("history.complete", fields)
+	}()
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		ctx := a.startCommandContext()
@@ -118,6 +138,7 @@ func (a *App) ListVersions(bundleID string, appID int64) (VersionsResult, error)
 		}
 
 		lastErr = err
+		a.writeDiagnostic("history.attempt_failed", map[string]interface{}{"attempt": attempt, "error": err.Error()})
 		if ctx.Err() != nil || !isRetryableAppleResponse(err) || attempt == 3 {
 			break
 		}

@@ -17,6 +17,7 @@ type downloadProductEndpoint struct {
 
 func (t *appstore) sendDownloadProduct(acc Account, app App, guid, externalVersionID string, platform Platform) (http.Result[downloadResult], error) {
 	primary := t.downloadProductRequest(acc, app, guid, externalVersionID, volumeStoreEndpoint(acc))
+	t.trace("download.route", map[string]interface{}{"route": "volume_store", "endpoint": http.DiagnosticURL(primary.URL), "version_id": externalVersionID})
 	res, err := t.downloadClient.Send(primary)
 	if err != nil {
 		return http.Result[downloadResult]{}, fmt.Errorf("failed to send http request: %w", err)
@@ -57,6 +58,7 @@ func (t *appstore) sendDownloadProduct(acc Account, app App, guid, externalVersi
 	}
 
 	req := t.downloadProductRequest(acc, app, guid, externalVersionID, redownload)
+	t.trace("download.route", map[string]interface{}{"route": "redownload", "endpoint": http.DiagnosticURL(req.URL), "version_id": externalVersionID})
 	res, err = t.downloadClient.Send(req)
 	if err != nil {
 		if isEmptyInternalServerError(err) && bag.UpdateEndpoint != "" {
@@ -76,6 +78,7 @@ func (t *appstore) sendUpdateProduct(acc Account, app App, guid, externalVersion
 	}
 
 	req := t.downloadProductRequest(acc, app, guid, externalVersionID, update)
+	t.trace("download.route", map[string]interface{}{"route": "update", "endpoint": http.DiagnosticURL(req.URL), "version_id": externalVersionID})
 	res, err := t.downloadClient.Send(req)
 	if err != nil {
 		return http.Result[downloadResult]{}, fmt.Errorf("failed to send update request: %w", err)

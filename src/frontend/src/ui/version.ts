@@ -1,4 +1,4 @@
-export const bundledAppVersion = '1.3'
+export const bundledAppVersion = '1.4'
 
 export function formatAppVersion(value: unknown): string {
   const version = typeof value === 'string' ? value.trim() : ''

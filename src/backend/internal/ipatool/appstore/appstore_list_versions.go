@@ -17,6 +17,7 @@ type ListVersionsOutput struct {
 }
 
 func (t *appstore) ListVersions(input ListVersionsInput) (ListVersionsOutput, error) {
+	t.trace("history.request", map[string]interface{}{"bundle_id": input.App.BundleID, "app_id": input.App.ID})
 	macAddr, err := t.machine.MacAddress()
 	if err != nil {
 		return ListVersionsOutput{}, fmt.Errorf("failed to get mac address: %w", err)

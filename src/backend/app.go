@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,8 @@ type App struct {
 	accounts           accountRegistry
 	cachedAccountID    string
 	cachedAccountEmail string
+	diagnosticMu       sync.Mutex
+	diagnosticSecrets  []string
 }
 
 func NewApp() *App {
@@ -62,6 +65,7 @@ func (a *App) Startup(ctx context.Context) {
 	a.settings.DefaultDownloadDir = a.getDownloadsDir()
 	a.settingsMu.Unlock()
 	a.loadTasks()
+	a.writeDiagnostic("app.start", map[string]interface{}{"version": AppVersion, "go_version": goruntime.Version(), "http_proxy_environment": os.Getenv("HTTP_PROXY") != "", "https_proxy_environment": os.Getenv("HTTPS_PROXY") != ""})
 	initWindowIcon()
 }
 

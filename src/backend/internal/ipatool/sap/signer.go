@@ -1,8 +1,10 @@
 package sap
 
 import (
+	apphttp "AppleVault/src/backend/internal/ipatool/http"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 )
 
@@ -11,10 +13,12 @@ const supportedVersion = uint32(200)
 var errSignerClosed = errors.New("SAP signer is closed")
 
 type Config struct {
-	SetupURL       string
-	CertificateURL string
-	Version        uint32
-	HardwareID     []byte
+	SetupURL         string
+	CertificateURL   string
+	Version          uint32
+	HardwareID       []byte
+	DiagnosticLogger apphttp.DiagnosticLogger
+	Transport        http.RoundTripper
 }
 
 type ActionSigner interface {

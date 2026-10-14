@@ -8,14 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"howett.net/plist"
 )
 
 const appStoreAuthPath = "/WebObjects/MZFinance.woa/wa/authenticate"
+
+const DefaultAuthenticationTimeout = 30 * time.Second
+
+func IsAuthenticationRedirect(status int) bool {
+	return status == http.StatusMovedPermanently || status == http.StatusFound || status == http.StatusTemporaryRedirect || status == http.StatusPermanentRedirect
+}
 
 var (
 	documentXMLPattern = regexp.MustCompile(`(?is)<Document\b[^>]*>(.*)</Document>`)
@@ -32,25 +41,38 @@ type Client[R interface{}] interface {
 }
 
 type client[R interface{}] struct {
-	internalClient http.Client
-	cookieJar      CookieJar
-	context        context.Context
+	internalClient   http.Client
+	cookieJar        CookieJar
+	context          context.Context
+	diagnosticLogger DiagnosticLogger
+	authentication   bool
 }
 
 type Args struct {
-	CookieJar CookieJar
-	Context   context.Context
-	Transport http.RoundTripper
+	CookieJar        CookieJar
+	Context          context.Context
+	Transport        http.RoundTripper
+	DiagnosticLogger DiagnosticLogger
+	Authentication   bool
+	Timeout          time.Duration
 }
 
 // UnexpectedResponseError preserves the HTTP status when Apple returns an
 // HTML or empty response where an XML plist was expected.
 type UnexpectedResponseError struct {
-	StatusCode int
-	Snippet    string
+	StatusCode    int
+	Snippet       string
+	Reason        string
+	BodyLength    int
+	ContentType   string
+	CorrelationID string
+	RetryAfter    string
 }
 
 func (e *UnexpectedResponseError) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("unexpected response from Apple (HTTP %d): %s (body length=%d, content type=%q, correlation ID=%q)", e.StatusCode, e.Reason, e.BodyLength, e.ContentType, e.CorrelationID)
+	}
 	if e.Snippet == "" {
 		return fmt.Sprintf("unexpected response from Apple (HTTP %d): empty or non-plist body", e.StatusCode)
 	}
@@ -84,12 +106,24 @@ func NewClient[R interface{}](args Args) Client[R] {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
+	timeout := args.Timeout
+	if args.Authentication {
+		if timeout == 0 {
+			timeout = DefaultAuthenticationTimeout
+		}
+		if base, ok := transport.(*http.Transport); ok {
+			isolated := base.Clone()
+			isolated.DisableKeepAlives = true
+			isolated.DialContext = (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+			transport = isolated
+		}
+	}
 	return &client[R]{
 		internalClient: http.Client{
-			Timeout: 0,
+			Timeout: timeout,
 			Jar:     args.CookieJar,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 0 && via[len(via)-1].URL.Path == appStoreAuthPath {
+				if args.Authentication || (len(via) > 0 && (via[len(via)-1].URL.Path == appStoreAuthPath || via[len(via)-1].URL.Path == appStoreAuthPath+"/")) {
 					return http.ErrUseLastResponse
 				}
 
@@ -97,12 +131,23 @@ func NewClient[R interface{}](args Args) Client[R] {
 			},
 			Transport: &AddHeaderTransport{transport},
 		},
-		cookieJar: args.CookieJar,
-		context:   ctx,
+		cookieJar:        args.CookieJar,
+		context:          ctx,
+		diagnosticLogger: args.DiagnosticLogger,
+		authentication:   args.Authentication,
 	}
 }
 
-func (c *client[R]) Send(req Request) (Result[R], error) {
+func (c *client[R]) Send(req Request) (output Result[R], sendErr error) {
+	id := diagnosticRequestID.Add(1)
+	started := time.Now()
+	defer func() {
+		fields := map[string]interface{}{"request_id": id, "elapsed_ms": time.Since(started).Milliseconds(), "endpoint": DiagnosticURL(req.URL)}
+		if sendErr != nil {
+			fields["error"] = sendErr.Error()
+		}
+		c.trace("http.complete", fields)
+	}()
 	var (
 		data []byte
 		err  error
@@ -132,12 +177,43 @@ func (c *client[R]) Send(req Request) (Result[R], error) {
 
 		request.Header.Set(HeaderAppleActionSignature, base64.StdEncoding.EncodeToString(signature))
 	}
+	if request.Header.Get("User-Agent") == "" {
+		request.Header.Set("User-Agent", DefaultUserAgent)
+	}
+	requestFields := diagnosticRequestFields(request, id)
+	if c.internalClient.Jar != nil {
+		requestFields["cookie_count"] = len(request.Cookies()) + len(c.internalClient.Jar.Cookies(request.URL))
+	}
+	if payload, ok := req.Payload.(*XMLPayload); ok {
+		keys := make([]string, 0, len(payload.Content))
+		for key := range payload.Content {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		requestFields["payload_format"] = "xml_plist"
+		requestFields["payload_keys"] = keys
+		if attempt, ok := payload.Content["attempt"]; ok {
+			requestFields["auth_attempt"] = attempt
+		}
+	}
+	c.trace("http.request", requestFields)
 
 	res, err := c.internalClient.Do(request)
 	if err != nil {
-		return Result[R]{}, fmt.Errorf("request failed: %w", err)
+		return Result[R]{}, fmt.Errorf("request failed: %w", &TransportError{Err: err})
 	}
 	defer res.Body.Close()
+	c.trace("http.response", diagnosticResponseFields(res, id))
+	if c.diagnosticLogger != nil && req.ResponseFormat != ResponseFormatRaw {
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
+		}
+		res.Body = io.NopCloser(bytes.NewReader(body))
+		fields := diagnosticBodySummary(body, req.ResponseFormat)
+		fields["request_id"] = id
+		c.trace("http.body_summary", fields)
+	}
 
 	err = c.cookieJar.Save()
 	if err != nil {
@@ -178,10 +254,21 @@ func (c *client[R]) handleRawResponse(res *http.Response) (Result[R], error) {
 }
 
 func (c *client[R]) Do(req *http.Request) (*http.Response, error) {
+	id := diagnosticRequestID.Add(1)
+	started := time.Now()
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", DefaultUserAgent)
+	}
+	c.trace("http.stream_request", diagnosticRequestFields(req, id))
 	res, err := c.internalClient.Do(req)
 	if err != nil {
+		c.trace("http.stream_error", map[string]interface{}{"request_id": id, "error": err.Error(), "elapsed_ms": time.Since(started).Milliseconds()})
 		return nil, fmt.Errorf("received error: %w", err)
 	}
+	fields := diagnosticResponseFields(res, id)
+	fields["elapsed_ms"] = time.Since(started).Milliseconds()
+	fields["content_range"] = res.Header.Get("Content-Range")
+	c.trace("http.stream_response", fields)
 
 	return res, nil
 }
@@ -217,10 +304,13 @@ func (c *client[R]) handleJSONResponse(res *http.Response) (Result[R], error) {
 func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
+		return Result[R]{}, fmt.Errorf("failed to read response body: %w", &TransportError{Err: err, RetryAfter: res.Header.Get("Retry-After")})
 	}
 
-	if res.StatusCode == http.StatusTooManyRequests {
+	if c.authentication && IsAuthenticationRedirect(res.StatusCode) && strings.TrimSpace(res.Header.Get("Location")) == "" {
+		return Result[R]{}, authenticationResponseError(res, body, "authentication redirect is missing Location")
+	}
+	if !c.authentication && res.StatusCode == http.StatusTooManyRequests {
 		return Result[R]{}, fmt.Errorf("rate limited by Apple (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
@@ -239,6 +329,9 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 	normalizedBody := normalizeXMLPlistBody(body)
 
 	if !looksLikePropertyList(normalizedBody) {
+		if c.authentication {
+			return Result[R]{}, authenticationResponseError(res, body, "empty or non-plist authentication response")
+		}
 		snippet := bodySnippet(body)
 
 		return Result[R]{}, &UnexpectedResponseError{
@@ -249,6 +342,9 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 
 	_, err = plist.Unmarshal(normalizedBody, &data)
 	if err != nil {
+		if c.authentication {
+			return Result[R]{}, authenticationResponseError(res, body, "malformed authentication plist")
+		}
 		return Result[R]{}, fmt.Errorf("failed to unmarshal xml: %w", err)
 	}
 
@@ -257,6 +353,15 @@ func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
 		Headers:    responseHeaders(res),
 		Data:       data,
 	}, nil
+}
+
+func authenticationResponseError(res *http.Response, body []byte, reason string) *UnexpectedResponseError {
+	return &UnexpectedResponseError{
+		StatusCode: res.StatusCode, Reason: reason, BodyLength: len(body),
+		ContentType:   bodySnippet([]byte(res.Header.Get("Content-Type"))),
+		CorrelationID: bodySnippet([]byte(res.Header.Get("X-Apple-Jingle-Correlation-Key"))),
+		RetryAfter:    res.Header.Get("Retry-After"),
+	}
 }
 
 func responseHeaders(res *http.Response) map[string]string {

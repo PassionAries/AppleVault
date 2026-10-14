@@ -45,7 +45,8 @@ Write-Host "==> [3/4] 检查 Windows Logo 图标与应用资源嵌入..." -Foreg
 $SysoFile = "$SourceDir/rsrc_windows_amd64.syso"
 $IconFile = "$ScriptDir/build/appicon.png"
 $ShouldRegenerateResources = -not (Test-Path $SysoFile) -or `
-    ((Test-Path $IconFile) -and ((Get-Item $IconFile).LastWriteTimeUtc -gt (Get-Item $SysoFile).LastWriteTimeUtc))
+    ((Test-Path $IconFile) -and ((Get-Item $IconFile).LastWriteTimeUtc -gt (Get-Item $SysoFile).LastWriteTimeUtc)) -or `
+    ((Get-Item $MyInvocation.MyCommand.Definition).LastWriteTimeUtc -gt (Get-Item $SysoFile).LastWriteTimeUtc)
 if ($ShouldRegenerateResources) {
     $WinresCmd = Get-Command go-winres -ErrorAction SilentlyContinue
     if (-not $WinresCmd -and (Test-Path "$env:USERPROFILE/go/bin/go-winres.exe")) {
@@ -58,17 +59,22 @@ if ($ShouldRegenerateResources) {
             "--manifest", "gui",
             "--product-name", "果仓助手",
             "--file-description", "果仓助手 (AppleVault)",
-            "--product-version", "1.3.0",
-            "--file-version", "1.3.0",
+            "--product-version", "1.4.0",
+            "--file-version", "1.4.0",
             "--copyright", "AppleVault (果仓助手)",
             "--arch", "amd64"
         )
         Push-Location $SourceDir
         try {
             & $WinresCmd @winresArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "Windows 应用资源生成失败"
+            }
         } finally {
             Pop-Location
         }
+    } else {
+        throw "需要 go-winres 生成 Windows 应用资源"
     }
 }
 

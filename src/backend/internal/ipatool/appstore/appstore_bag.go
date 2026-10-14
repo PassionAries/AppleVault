@@ -1,6 +1,7 @@
 package appstore
 
 import (
+	"errors"
 	"fmt"
 	gohttp "net/http"
 	"net/url"
@@ -60,6 +61,18 @@ func (t *appstore) bag(guid string) (BagOutput, error) {
 	if err := validateSAPConfig(config); err != nil {
 		return BagOutput{}, err
 	}
+	authURL, err := url.Parse(config.AuthEndpoint)
+	if err != nil {
+		return BagOutput{}, fmt.Errorf("failed to parse authentication endpoint: %w", err)
+	}
+	// Match ipatool's canonical route before the first signed POST. Apple's bare
+	// route can return an empty response or a 301 with no Location header.
+	authURL.Path = PrivateAppStoreAPIPathAuth + "/"
+	config.AuthEndpoint = authURL.String()
+	t.trace("bag.config", map[string]interface{}{
+		"auth_endpoint": http.DiagnosticURL(config.AuthEndpoint), "sap_setup_endpoint": http.DiagnosticURL(config.SetupURL),
+		"redownload_endpoint": http.DiagnosticURL(res.Data.URLBag.RedownloadEndpoint), "update_endpoint": http.DiagnosticURL(res.Data.URLBag.UpdateEndpoint), "sap_version": config.Version,
+	})
 
 	return BagOutput{
 		AuthEndpoint:       config.AuthEndpoint,
@@ -110,18 +123,19 @@ func validateSAPConfig(config SAPConfig) error {
 }
 
 func validateAuthenticationEndpoint(endpoint string) error {
-	parsed, err := url.ParseRequestURI(endpoint)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return fmt.Errorf("invalid authentication endpoint %q", endpoint)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawPath != "" || (parsed.Port() != "" && parsed.Port() != "443") {
+		return errors.New("invalid authentication endpoint")
 	}
 
 	host := strings.ToLower(parsed.Hostname())
 	if host != PrivateAppStoreAPIDomain && !strings.HasSuffix(host, "-buy.itunes.apple.com") {
-		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
+		return errors.New("unsupported authentication endpoint")
 	}
 
-	if parsed.Path != PrivateAppStoreAPIPathAuth {
-		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
+	if parsed.Path != PrivateAppStoreAPIPathAuth && parsed.Path != PrivateAppStoreAPIPathAuth+"/" {
+		return errors.New("unsupported authentication endpoint")
 	}
 
 	return nil

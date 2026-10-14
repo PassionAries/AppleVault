@@ -224,13 +224,19 @@ func (a *App) RefreshAccount(accountID string) (AccountInfo, error) {
 	if !ok {
 		return AccountInfo{}, errors.New("账号不存在")
 	}
-	store, err := a.newAppStoreWithStorage(context.Background(), item.ID, item.Legacy)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	store, err := a.newAppStoreWithStorage(ctx, item.ID, item.Legacy)
 	if err != nil {
 		return AccountInfo{}, err
 	}
 	storedInfo, err := store.AccountInfo()
 	if err != nil {
 		return AccountInfo{}, fmt.Errorf("读取账号凭据失败: %w", err)
+	}
+	refreshed, err := refreshAccount(store, storedInfo.Account)
+	if err != nil {
+		return AccountInfo{}, err
 	}
 
 	a.accountMu.Lock()
@@ -239,9 +245,10 @@ func (a *App) RefreshAccount(accountID string) (AccountInfo, error) {
 		if a.accounts.Accounts[index].ID != accountID {
 			continue
 		}
-		a.accounts.Accounts[index].Name = storedInfo.Account.Name
-		a.accounts.Accounts[index].Email = storedInfo.Account.Email
-		a.accounts.Accounts[index].Region = regionFromStoreFront(storedInfo.Account.StoreFront)
+		a.accounts.Accounts[index].Name = refreshed.Name
+		a.accounts.Accounts[index].Email = refreshed.Email
+		a.accounts.Accounts[index].Region = regionFromStoreFront(refreshed.StoreFront)
+		a.syncCachedAccountLocked()
 		if err := a.saveAccountsLocked(); err != nil {
 			return AccountInfo{}, err
 		}
